@@ -98,15 +98,31 @@ class Task
     /**
      * Generator to yield results from a streaming task.
      *
+     * @param Redis $redis Redis client instance
+     * @param int $timeout Maximum time to wait for stream in seconds (default 300s/5min)
      * @return Generator<mixed>
+     * @throws TaskTimeoutException If stream times out
+     * @throws TaskProcessingException If task failed or was cancelled
      */
-    public function getStream(Redis $redis): Generator
+    public function getStream(Redis $redis, int $timeout = 300): Generator
     {
         $streamKey = "task_stream:{$this->taskId}";
         $lastId = '0-0';
         $completed = false;
+        $startTime = microtime(true);
 
         while (!$completed) {
+            // Check timeout
+            if ((microtime(true) - $startTime) > $timeout) {
+                throw new TaskTimeoutException($this->taskId);
+            }
+
+            // Check if task was cancelled
+            if ($this->isCancelled($redis)) {
+                $this->status = 'cancelled';
+                return;
+            }
+
             // Use phpredis xRead with blocking
             $results = $redis->xRead([$streamKey => $lastId], 10, 1000);
 
@@ -116,6 +132,7 @@ class Task
                         $result = json_decode($messageData['result'], true);
                         yield $result;
                         $lastId = $messageId;
+                        // Handle non-string types properly
                         $this->combinedResult .= is_string($result) ? $result : json_encode($result);
                     }
                 }
@@ -124,16 +141,21 @@ class Task
             $taskJson = $redis->get("task_result:{$this->taskId}");
             if ($taskJson) {
                 $taskData = json_decode($taskJson, true);
-                if ($taskData['status'] === 'completed') {
+                $status = $taskData['status'] ?? null;
+
+                if ($status === 'completed') {
                     $completed = true;
                     $this->status = 'completed';
                     $this->result = $this->combinedResult;
-                } elseif ($taskData['status'] === 'failed') {
+                } elseif ($status === 'failed') {
                     $errorMessage = $taskData['result'] ?? 'Task failed without an error message';
                     throw new TaskProcessingException(
                         $taskData['task_name'] ?? $this->taskName,
                         $errorMessage
                     );
+                } elseif ($status === 'cancelled') {
+                    $this->status = 'cancelled';
+                    return;
                 }
             }
         }
@@ -153,6 +175,12 @@ class Task
         $startTime = microtime(true);
 
         while ((microtime(true) - $startTime) < $timeout) {
+            // Check if task was cancelled
+            if ($this->isCancelled($redis)) {
+                $this->status = 'cancelled';
+                throw new TaskProcessingException($this->taskName, 'Task was cancelled');
+            }
+
             $taskJson = $redis->get("task_result:{$this->taskId}");
 
             if ($taskJson) {
@@ -166,6 +194,10 @@ class Task
                         $taskData['task_name'] ?? $this->taskName,
                         is_string($errorMessage) ? $errorMessage : json_encode($errorMessage)
                     );
+                }
+
+                if ($this->status === 'cancelled') {
+                    throw new TaskProcessingException($this->taskName, 'Task was cancelled');
                 }
 
                 if ($this->status === 'completed') {
@@ -192,5 +224,30 @@ class Task
         }
 
         return null;
+    }
+
+    /**
+     * Get the current progress of this task.
+     *
+     * @return array{progress: float, message: ?string, updated_at: float}|null
+     */
+    public function getProgress(Redis $redis): ?array
+    {
+        $progressData = $redis->get("task:{$this->taskId}:progress");
+
+        if ($progressData) {
+            return json_decode($progressData, true);
+        }
+
+        return null;
+    }
+
+    /**
+     * Check if this task has been cancelled.
+     */
+    public function isCancelled(Redis $redis): bool
+    {
+        $cancelled = $redis->get("task:{$this->taskId}:cancelled");
+        return $cancelled !== false && $cancelled !== null;
     }
 }

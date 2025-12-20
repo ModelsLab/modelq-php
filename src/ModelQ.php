@@ -26,7 +26,9 @@ class ModelQ
     public const PRUNE_TIMEOUT = 300;
     public const PRUNE_CHECK_INTERVAL = 60;
     public const TASK_RESULT_RETENTION = 86400;
-    public const TASK_HISTORY_RETENTION = 604800; // 7 days
+    public const TASK_HISTORY_RETENTION = 86400;  // 24 hours (configurable)
+    public const TASK_TTL = 86400;                 // 24 hours TTL for all tasks
+    public const DEFAULT_STREAM_TIMEOUT = 300;     // 5 minutes default stream timeout
 
     private Redis $redis;
     private string $serverId;
@@ -37,6 +39,8 @@ class ModelQ
     private ?string $webhookUrl = null;
     private ?int $requeueThreshold = null;
     private int $delaySeconds;
+    private int $taskHistoryRetention;
+    private int $taskTtl;
     private LoggerInterface $logger;
     private bool $running = false;
 
@@ -50,6 +54,8 @@ class ModelQ
         ?string $webhookUrl = null,
         ?int $requeueThreshold = null,
         int $delaySeconds = 30,
+        ?int $taskHistoryRetention = null,
+        ?int $taskTtl = null,
         ?LoggerInterface $logger = null
     ) {
         if ($redisClient) {
@@ -67,6 +73,8 @@ class ModelQ
         $this->webhookUrl = $webhookUrl;
         $this->requeueThreshold = $requeueThreshold;
         $this->delaySeconds = $delaySeconds;
+        $this->taskHistoryRetention = $taskHistoryRetention ?? self::TASK_HISTORY_RETENTION;
+        $this->taskTtl = $taskTtl ?? self::TASK_TTL;
         $this->logger = $logger ?? new NullLogger();
 
         $this->registerServer();
@@ -1009,5 +1017,151 @@ EOT;
         }
 
         curl_close($ch);
+    }
+
+    // ============================================
+    // Task Cancellation Methods
+    // ============================================
+
+    /**
+     * Cancel a task. Works for queued or processing tasks.
+     * - If queued: removes from queue and marks as cancelled
+     * - If processing: marks as cancelled (worker will check and stop)
+     *
+     * @return bool True if task was found and cancelled
+     */
+    public function cancelTask(string $taskId): bool
+    {
+        // Set cancellation flag
+        $this->redis->setex("task:{$taskId}:cancelled", $this->taskTtl, '1');
+
+        // Try to remove from queue
+        $removedFromQueue = $this->removeTaskFromQueue($taskId);
+
+        // Update task status
+        $taskJson = $this->redis->get("task:{$taskId}");
+        if ($taskJson) {
+            $taskDict = json_decode($taskJson, true);
+            $taskDict['status'] = 'cancelled';
+            $taskDict['finished_at'] = microtime(true);
+            $this->redis->setex("task:{$taskId}", $this->taskTtl, json_encode($taskDict));
+            $this->updateTaskHistory($taskId, $taskDict);
+            $this->logger->info("Task {$taskId} cancelled.");
+            return true;
+        }
+
+        return $removedFromQueue;
+    }
+
+    /**
+     * Check if a task has been cancelled.
+     * Workers should call this periodically during long-running tasks.
+     */
+    public function isTaskCancelled(string $taskId): bool
+    {
+        return $this->redis->exists("task:{$taskId}:cancelled") > 0;
+    }
+
+    /**
+     * Get tasks that have been cancelled.
+     */
+    public function getCancelledTasks(int $limit = 100): array
+    {
+        return $this->getTaskHistory($limit, 0, 'cancelled');
+    }
+
+    // ============================================
+    // Progress Tracking Methods
+    // ============================================
+
+    /**
+     * Report progress for a long-running task.
+     *
+     * @param string $taskId The task ID
+     * @param float $progress Progress value between 0.0 and 1.0 (0% to 100%)
+     * @param string|null $message Optional progress message
+     */
+    public function reportProgress(string $taskId, float $progress, ?string $message = null): void
+    {
+        $progressData = [
+            'progress' => min(max($progress, 0.0), 1.0), // Clamp to 0-1
+            'message' => $message,
+            'updated_at' => microtime(true),
+        ];
+
+        $this->redis->setex(
+            "task:{$taskId}:progress",
+            $this->taskTtl,
+            json_encode($progressData)
+        );
+    }
+
+    /**
+     * Get the current progress of a task.
+     *
+     * @return array|null Dict with progress, message, updated_at or null if no progress
+     */
+    public function getTaskProgress(string $taskId): ?array
+    {
+        $progressJson = $this->redis->get("task:{$taskId}:progress");
+        if ($progressJson) {
+            return json_decode($progressJson, true);
+        }
+        return null;
+    }
+
+    // ============================================
+    // Task TTL Validation
+    // ============================================
+
+    /**
+     * Remove tasks that have exceeded their TTL from the queue.
+     *
+     * @return int Number of expired tasks removed
+     */
+    public function cleanupExpiredTasks(): int
+    {
+        $removed = 0;
+        $cutoff = microtime(true) - $this->taskTtl;
+
+        // Check queued tasks
+        $tasksInQueue = $this->redis->lRange('ml_tasks', 0, -1);
+        foreach ($tasksInQueue as $taskJson) {
+            try {
+                $taskDict = json_decode($taskJson, true);
+                $createdAt = $taskDict['created_at'] ?? 0;
+                if ($createdAt && $createdAt < $cutoff) {
+                    $this->redis->lRem('ml_tasks', $taskJson, 1);
+                    $taskId = $taskDict['task_id'] ?? null;
+                    if ($taskId) {
+                        $taskDict['status'] = 'expired';
+                        $taskDict['finished_at'] = microtime(true);
+                        $this->updateTaskHistory($taskId, $taskDict);
+                        $this->logger->info("Removed expired task {$taskId} from queue.");
+                    }
+                    $removed++;
+                }
+            } catch (Throwable $e) {
+                $this->logger->error("Error checking task expiry: {$e->getMessage()}");
+            }
+        }
+
+        return $removed;
+    }
+
+    /**
+     * Get the task TTL setting.
+     */
+    public function getTaskTtl(): int
+    {
+        return $this->taskTtl;
+    }
+
+    /**
+     * Get the task history retention setting.
+     */
+    public function getTaskHistoryRetention(): int
+    {
+        return $this->taskHistoryRetention;
     }
 }
