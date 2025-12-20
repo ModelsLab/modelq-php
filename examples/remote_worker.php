@@ -1,0 +1,359 @@
+<?php
+
+/**
+ * ModelQ PHP - Remote Worker Example
+ *
+ * This example demonstrates how to use ModelQ PHP as a client/producer
+ * to interact with a REMOTE Python ModelQ worker running on a GPU server.
+ *
+ * Architecture:
+ * ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+ * │   PHP Frontend  │─────▶│  Managed Redis  │◀─────│ Python Worker   │
+ * │   (Producer)    │      │  (AWS/GCP/etc)  │      │ (GPU Server)    │
+ * └─────────────────┘      └─────────────────┘      └─────────────────┘
+ *
+ * The Python worker handles ML inference tasks (image generation, LLM, etc.)
+ * The PHP frontend enqueues tasks and retrieves results.
+ *
+ * IMPORTANT: Both PHP and Python must use the same Redis instance!
+ */
+
+declare(strict_types=1);
+
+require_once __DIR__ . '/../vendor/autoload.php';
+
+use ModelsLab\ModelQ\ModelQ;
+use ModelsLab\ModelQ\Exception\TaskTimeoutException;
+use ModelsLab\ModelQ\Exception\TaskProcessingException;
+
+echo "=== ModelQ PHP - Remote Worker Integration ===\n\n";
+
+// ============================================
+// Configuration for Remote Redis
+// ============================================
+
+// Option 1: Managed Redis (AWS ElastiCache, GCP Memorystore, etc.)
+$redisConfig = [
+    'host' => getenv('REDIS_HOST') ?: 'your-redis.cache.amazonaws.com',
+    'port' => (int)(getenv('REDIS_PORT') ?: 6379),
+    'password' => getenv('REDIS_PASSWORD') ?: null,
+    'db' => (int)(getenv('REDIS_DB') ?: 0),
+];
+
+// Option 2: Redis with SSL (for production)
+// $redis = new Redis();
+// $redis->connect('tls://your-redis-host', 6379);
+// $redis->auth(['user' => 'default', 'pass' => 'your-password']);
+
+echo "Connecting to Redis: {$redisConfig['host']}:{$redisConfig['port']}\n\n";
+
+// For this demo, use localhost (replace with your remote Redis in production)
+$modelq = new ModelQ(
+    host: '127.0.0.1',  // Replace with your managed Redis host
+    port: 6379,
+    password: $redisConfig['password'],
+    db: $redisConfig['db'],
+);
+
+// ============================================
+// Register Tasks (Matching Python Worker)
+// ============================================
+
+/*
+ * IMPORTANT: The task names MUST match what's registered on the Python worker!
+ *
+ * Example Python worker (running on GPU server):
+ *
+ * from modelq import ModelQ
+ *
+ * app = ModelQ(
+ *     redis_host="your-redis.cache.amazonaws.com",
+ *     redis_port=6379,
+ *     redis_password="your-password"
+ * )
+ *
+ * @app.task("generate_image")
+ * def generate_image(data):
+ *     prompt = data.get("prompt")
+ *     model = data.get("model", "stable-diffusion-xl")
+ *     # Use GPU to generate image...
+ *     return {"image_url": "https://..."}
+ *
+ * @app.task("text_to_speech")
+ * def text_to_speech(data):
+ *     text = data.get("text")
+ *     voice = data.get("voice", "en-US-1")
+ *     # Generate audio...
+ *     return {"audio_url": "https://..."}
+ *
+ * @app.task("llm_completion", stream=True)
+ * def llm_completion(data):
+ *     prompt = data.get("prompt")
+ *     for token in generate_tokens(prompt):
+ *         yield token
+ *
+ * app.run_workers(num_workers=4)
+ */
+
+// Register the same tasks on PHP side (handlers are empty - Python worker does the work)
+$modelq->task('generate_image', fn($data) => null);
+$modelq->task('text_to_speech', fn($data) => null);
+$modelq->task('llm_completion', fn($data) => null, ['stream' => true]);
+$modelq->task('process_video', fn($data) => null);
+$modelq->task('face_detection', fn($data) => null);
+
+echo "Registered tasks for remote Python worker:\n";
+foreach ($modelq->getAllowedTasks() as $task) {
+    echo "  - {$task}\n";
+}
+echo "\n";
+
+// ============================================
+// Example 1: Image Generation (Stable Diffusion)
+// ============================================
+echo "Example 1: Image Generation\n";
+echo "   Sending task to Python GPU worker...\n";
+
+try {
+    $task = $modelq->enqueue('generate_image', [
+        'prompt' => 'A beautiful sunset over mountains, digital art, 4k',
+        'model' => 'stable-diffusion-xl',
+        'width' => 1024,
+        'height' => 1024,
+        'steps' => 30,
+        'guidance_scale' => 7.5,
+    ]);
+
+    echo "   Task ID: {$task->taskId}\n";
+    echo "   Waiting for GPU to generate image...\n";
+
+    // Image generation can take 10-60 seconds depending on model/settings
+    $result = $task->getResult($modelq->getRedisClient(), timeout: 120);
+
+    echo "   Image URL: {$result['image_url']}\n";
+    echo "   Generation time: {$result['generation_time']}s\n\n";
+} catch (TaskTimeoutException $e) {
+    echo "   Note: Task timed out. In production, Python worker would be running.\n\n";
+} catch (TaskProcessingException $e) {
+    echo "   Error: {$e->getMessage()}\n\n";
+}
+
+// ============================================
+// Example 2: Text-to-Speech
+// ============================================
+echo "Example 2: Text-to-Speech\n";
+
+try {
+    $task = $modelq->enqueue('text_to_speech', [
+        'text' => 'Hello! This audio was generated by the ModelQ Python worker.',
+        'voice' => 'en-US-female-1',
+        'speed' => 1.0,
+        'format' => 'mp3',
+    ]);
+
+    echo "   Task ID: {$task->taskId}\n";
+    echo "   Waiting for audio generation...\n";
+
+    $result = $task->getResult($modelq->getRedisClient(), timeout: 60);
+
+    echo "   Audio URL: {$result['audio_url']}\n";
+    echo "   Duration: {$result['duration']}s\n\n";
+} catch (TaskTimeoutException $e) {
+    echo "   Note: Task timed out. In production, Python worker would be running.\n\n";
+}
+
+// ============================================
+// Example 3: LLM Streaming (ChatGPT-like)
+// ============================================
+echo "Example 3: LLM Streaming Response\n";
+echo "   Streaming tokens from Python LLM worker...\n\n";
+
+try {
+    $task = $modelq->enqueue('llm_completion', [
+        'prompt' => 'Explain quantum computing in simple terms',
+        'model' => 'llama-3-70b',
+        'max_tokens' => 200,
+        'temperature' => 0.7,
+    ]);
+
+    echo "   Task ID: {$task->taskId}\n";
+    echo "   Response: ";
+
+    foreach ($task->getStream($modelq->getRedisClient()) as $token) {
+        echo $token;
+        flush();
+    }
+
+    echo "\n\n   Streaming complete!\n\n";
+} catch (TaskTimeoutException $e) {
+    echo "\n   Note: Task timed out. In production, Python worker would be running.\n\n";
+}
+
+// ============================================
+// Example 4: Batch Processing
+// ============================================
+echo "Example 4: Batch Image Processing\n";
+echo "   Submitting multiple images for processing...\n";
+
+$images = [
+    ['url' => 'https://example.com/image1.jpg', 'operation' => 'upscale'],
+    ['url' => 'https://example.com/image2.jpg', 'operation' => 'remove_bg'],
+    ['url' => 'https://example.com/image3.jpg', 'operation' => 'enhance'],
+];
+
+$tasks = [];
+foreach ($images as $image) {
+    $tasks[] = $modelq->enqueue('generate_image', $image);
+}
+
+echo "   Submitted " . count($tasks) . " tasks\n";
+echo "   Task IDs:\n";
+foreach ($tasks as $task) {
+    echo "     - {$task->taskId}\n";
+}
+echo "\n";
+
+// ============================================
+// Example 5: Check Remote Worker Status
+// ============================================
+echo "Example 5: Remote Worker Status\n";
+
+$servers = $modelq->getRegisteredServerIds();
+echo "   Registered servers:\n";
+foreach ($servers as $serverId) {
+    echo "     - {$serverId}\n";
+}
+
+$redis = $modelq->getRedisClient();
+$serverData = $redis->hGetAll('servers');
+
+echo "\n   Server details:\n";
+foreach ($serverData as $serverId => $dataJson) {
+    $data = json_decode($dataJson, true);
+    echo "     Server: {$serverId}\n";
+    echo "       Status: {$data['status']}\n";
+    echo "       Tasks: " . implode(', ', $data['allowed_tasks'] ?? []) . "\n";
+    if (isset($data['last_heartbeat'])) {
+        $lastSeen = round(microtime(true) - $data['last_heartbeat']);
+        echo "       Last seen: {$lastSeen}s ago\n";
+    }
+}
+echo "\n";
+
+// ============================================
+// Example 6: Production Configuration
+// ============================================
+echo "Example 6: Production Configuration\n\n";
+
+$configCode = <<<'CODE'
+// config/modelq.php
+
+return [
+    // Managed Redis (AWS ElastiCache, GCP Memorystore, Redis Cloud, etc.)
+    'redis' => [
+        'host' => env('REDIS_HOST', 'your-redis.cache.amazonaws.com'),
+        'port' => env('REDIS_PORT', 6379),
+        'password' => env('REDIS_PASSWORD', null),
+        'db' => env('REDIS_DB', 0),
+
+        // For TLS connections (recommended for production)
+        'scheme' => env('REDIS_SCHEME', 'tcp'),  // 'tcp' or 'tls'
+    ],
+
+    // Task timeouts (adjust based on your ML workloads)
+    'timeouts' => [
+        'generate_image' => 120,    // Image generation: 2 minutes
+        'text_to_speech' => 60,     // TTS: 1 minute
+        'llm_completion' => 300,    // LLM: 5 minutes (streaming)
+        'process_video' => 600,     // Video: 10 minutes
+    ],
+];
+
+// In your application:
+$config = require 'config/modelq.php';
+
+$modelq = new ModelQ(
+    host: $config['redis']['host'],
+    port: $config['redis']['port'],
+    password: $config['redis']['password'],
+    db: $config['redis']['db'],
+);
+CODE;
+
+echo $configCode . "\n\n";
+
+// ============================================
+// Example 7: Laravel/Symfony Integration
+// ============================================
+echo "Example 7: Framework Integration\n\n";
+
+$frameworkCode = <<<'CODE'
+// Laravel Service Provider Example
+
+namespace App\Providers;
+
+use Illuminate\Support\ServiceProvider;
+use ModelsLab\ModelQ\ModelQ;
+
+class ModelQServiceProvider extends ServiceProvider
+{
+    public function register(): void
+    {
+        $this->app->singleton(ModelQ::class, function ($app) {
+            $modelq = new ModelQ(
+                host: config('modelq.redis.host'),
+                port: config('modelq.redis.port'),
+                password: config('modelq.redis.password'),
+            );
+
+            // Register tasks that match your Python worker
+            $modelq->task('generate_image', fn($d) => null);
+            $modelq->task('llm_completion', fn($d) => null, ['stream' => true]);
+
+            return $modelq;
+        });
+    }
+}
+
+// In your Controller:
+class AIController extends Controller
+{
+    public function generateImage(Request $request, ModelQ $modelq)
+    {
+        $task = $modelq->enqueue('generate_image', [
+            'prompt' => $request->input('prompt'),
+            'model' => 'stable-diffusion-xl',
+        ]);
+
+        // Option 1: Return task ID for polling
+        return response()->json(['task_id' => $task->taskId]);
+
+        // Option 2: Wait for result (blocking)
+        $result = $task->getResult($modelq->getRedisClient(), timeout: 120);
+        return response()->json($result);
+    }
+
+    // Streaming endpoint (for LLM responses)
+    public function streamCompletion(Request $request, ModelQ $modelq)
+    {
+        $task = $modelq->enqueue('llm_completion', [
+            'prompt' => $request->input('prompt'),
+        ]);
+
+        return response()->stream(function () use ($task, $modelq) {
+            foreach ($task->getStream($modelq->getRedisClient()) as $token) {
+                echo "data: " . json_encode(['token' => $token]) . "\n\n";
+                ob_flush();
+                flush();
+            }
+        }, 200, ['Content-Type' => 'text/event-stream']);
+    }
+}
+CODE;
+
+echo $frameworkCode . "\n";
+
+// Cleanup
+$modelq->deleteQueue();
+
+echo "\n=== Remote Worker Example Complete ===\n";

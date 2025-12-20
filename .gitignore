@@ -1,0 +1,8 @@
+/vendor/
+composer.lock
+.phpunit.result.cache
+phpstan.neon
+.idea/
+.vscode/
+*.log
+modelq_errors.log
