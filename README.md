@@ -247,6 +247,54 @@ $modelq->deleteQueue();
 $processing = $modelq->getProcessingTasks();
 ```
 
+### Task History & Monitoring
+
+Track past tasks, view errors, and monitor remote workers:
+
+```php
+// Get full task details (including error info for failed tasks)
+$details = $modelq->getTaskDetails($taskId);
+if ($details['status'] === 'failed') {
+    echo "Error: " . $details['error']['message'];
+    echo "Type: " . $details['error']['type'];
+    echo "File: " . $details['error']['file'] . ":" . $details['error']['line'];
+    echo "Trace: " . $details['error']['trace'];
+}
+
+// Get task history (most recent first)
+$history = $modelq->getTaskHistory(limit: 50);
+
+// Get only failed tasks
+$failed = $modelq->getFailedTasks(limit: 20);
+foreach ($failed as $task) {
+    echo "Task {$task['task_name']} failed: {$task['error']['message']}\n";
+}
+
+// Get only completed tasks
+$completed = $modelq->getCompletedTasks(limit: 20);
+
+// Filter by task name
+$imageTasks = $modelq->getTasksByName('process_image', limit: 50);
+
+// Get task statistics
+$stats = $modelq->getTaskStats();
+echo "Total: {$stats['total']}\n";
+echo "Completed: {$stats['by_status']['completed']}\n";
+echo "Failed: {$stats['by_status']['failed']}\n";
+
+// See per-task-name stats
+foreach ($stats['by_task_name'] as $name => $counts) {
+    echo "{$name}: {$counts['completed']}/{$counts['total']} succeeded\n";
+}
+
+// Get task count in history
+$count = $modelq->getTaskHistoryCount();
+
+// Clear old history (older than 7 days by default)
+$removed = $modelq->clearTaskHistory(); // Default: 7 days
+$removed = $modelq->clearTaskHistory(3600); // Older than 1 hour
+```
+
 ### Delayed Tasks
 
 ```php

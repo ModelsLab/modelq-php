@@ -26,6 +26,7 @@ class ModelQ
     public const PRUNE_TIMEOUT = 300;
     public const PRUNE_CHECK_INTERVAL = 60;
     public const TASK_RESULT_RETENTION = 86400;
+    public const TASK_HISTORY_RETENTION = 604800; // 7 days
 
     private Redis $redis;
     private string $serverId;
@@ -167,6 +168,9 @@ class ModelQ
 
         $this->enqueueTask($taskDict, $payload);
         $this->redis->setex("task:{$task->taskId}", 86400, json_encode($taskDict));
+
+        // Add to task history
+        $this->addToTaskHistory($task->taskId, $taskDict);
 
         return $task;
     }
@@ -379,7 +383,7 @@ class ModelQ
         } catch (Throwable $e) {
             $task->status = 'failed';
             $task->result = $e->getMessage();
-            $this->storeFinalTaskState($task, false);
+            $this->storeFinalTaskState($task, false, $e);
 
             $this->logTaskErrorToFile($task, $e);
             $this->checkMiddleware('on_error', $task, $e);
@@ -429,13 +433,27 @@ class ModelQ
     /**
      * Store the final state of a task in Redis.
      */
-    private function storeFinalTaskState(Task $task, bool $success): void
+    private function storeFinalTaskState(Task $task, bool $success, ?Throwable $error = null): void
     {
         $taskDict = $task->toArray();
         $taskDict['finished_at'] = microtime(true);
 
+        // Add error details if failed
+        if (!$success && $error) {
+            $taskDict['error'] = [
+                'message' => $error->getMessage(),
+                'type' => get_class($error),
+                'file' => $error->getFile(),
+                'line' => $error->getLine(),
+                'trace' => $error->getTraceAsString(),
+            ];
+        }
+
         $this->redis->setex("task_result:{$task->taskId}", 3600, json_encode($taskDict));
         $this->redis->setex("task:{$task->taskId}", 86400, json_encode($taskDict));
+
+        // Update task history
+        $this->updateTaskHistory($task->taskId, $taskDict);
     }
 
     /**
@@ -525,6 +543,211 @@ class ModelQ
             return $data['status'] ?? null;
         }
         return null;
+    }
+
+    // ========================================
+    // Task History Methods
+    // ========================================
+
+    /**
+     * Add a task to history.
+     */
+    private function addToTaskHistory(string $taskId, array $taskData): void
+    {
+        $score = $taskData['created_at'] ?? microtime(true);
+        $this->redis->zAdd('task_history', $score, $taskId);
+        $this->redis->setex("task_history:{$taskId}", self::TASK_HISTORY_RETENTION, json_encode($taskData));
+    }
+
+    /**
+     * Update task in history.
+     */
+    private function updateTaskHistory(string $taskId, array $taskData): void
+    {
+        $this->redis->setex("task_history:{$taskId}", self::TASK_HISTORY_RETENTION, json_encode($taskData));
+    }
+
+    /**
+     * Get full task details including error information.
+     *
+     * @return array|null Task data with error details if failed
+     */
+    public function getTaskDetails(string $taskId): ?array
+    {
+        // First try task_history (longer retention)
+        $taskData = $this->redis->get("task_history:{$taskId}");
+        if (!$taskData) {
+            // Fallback to task:{id}
+            $taskData = $this->redis->get("task:{$taskId}");
+        }
+
+        if ($taskData) {
+            return json_decode($taskData, true);
+        }
+
+        return null;
+    }
+
+    /**
+     * Get task history with optional filters.
+     *
+     * @param int $limit Maximum number of tasks to return
+     * @param int $offset Number of tasks to skip
+     * @param string|null $status Filter by status (queued, processing, completed, failed)
+     * @param string|null $taskName Filter by task name
+     * @return array List of tasks with their details
+     */
+    public function getTaskHistory(
+        int $limit = 50,
+        int $offset = 0,
+        ?string $status = null,
+        ?string $taskName = null
+    ): array {
+        // Get task IDs from sorted set (newest first)
+        $taskIds = $this->redis->zRevRange('task_history', $offset, $offset + $limit - 1);
+
+        $tasks = [];
+        foreach ($taskIds as $taskId) {
+            $taskData = $this->redis->get("task_history:{$taskId}");
+            if ($taskData) {
+                $task = json_decode($taskData, true);
+
+                // Apply filters
+                if ($status !== null && ($task['status'] ?? '') !== $status) {
+                    continue;
+                }
+                if ($taskName !== null && ($task['task_name'] ?? '') !== $taskName) {
+                    continue;
+                }
+
+                $tasks[] = $task;
+            }
+        }
+
+        return $tasks;
+    }
+
+    /**
+     * Get failed tasks with error details.
+     *
+     * @param int $limit Maximum number of tasks to return
+     * @return array List of failed tasks with error information
+     */
+    public function getFailedTasks(int $limit = 50): array
+    {
+        return $this->getTaskHistory(limit: $limit, status: 'failed');
+    }
+
+    /**
+     * Get completed tasks.
+     *
+     * @param int $limit Maximum number of tasks to return
+     * @return array List of completed tasks
+     */
+    public function getCompletedTasks(int $limit = 50): array
+    {
+        return $this->getTaskHistory(limit: $limit, status: 'completed');
+    }
+
+    /**
+     * Get tasks by task name.
+     *
+     * @param string $taskName The task name to filter by
+     * @param int $limit Maximum number of tasks to return
+     * @return array List of tasks matching the name
+     */
+    public function getTasksByName(string $taskName, int $limit = 50): array
+    {
+        return $this->getTaskHistory(limit: $limit, taskName: $taskName);
+    }
+
+    /**
+     * Get task statistics.
+     *
+     * @return array Statistics about tasks in history
+     */
+    public function getTaskStats(): array
+    {
+        $taskIds = $this->redis->zRange('task_history', 0, -1);
+
+        $stats = [
+            'total' => count($taskIds),
+            'by_status' => [
+                'queued' => 0,
+                'processing' => 0,
+                'completed' => 0,
+                'failed' => 0,
+            ],
+            'by_task_name' => [],
+            'failed_tasks' => [],
+        ];
+
+        foreach ($taskIds as $taskId) {
+            $taskData = $this->redis->get("task_history:{$taskId}");
+            if ($taskData) {
+                $task = json_decode($taskData, true);
+                $status = $task['status'] ?? 'unknown';
+                $taskName = $task['task_name'] ?? 'unknown';
+
+                // Count by status
+                if (isset($stats['by_status'][$status])) {
+                    $stats['by_status'][$status]++;
+                }
+
+                // Count by task name
+                if (!isset($stats['by_task_name'][$taskName])) {
+                    $stats['by_task_name'][$taskName] = ['total' => 0, 'completed' => 0, 'failed' => 0];
+                }
+                $stats['by_task_name'][$taskName]['total']++;
+                if ($status === 'completed') {
+                    $stats['by_task_name'][$taskName]['completed']++;
+                } elseif ($status === 'failed') {
+                    $stats['by_task_name'][$taskName]['failed']++;
+                    // Add to failed tasks list (limit to 10 most recent)
+                    if (count($stats['failed_tasks']) < 10) {
+                        $stats['failed_tasks'][] = [
+                            'task_id' => $task['task_id'],
+                            'task_name' => $taskName,
+                            'error' => $task['error']['message'] ?? $task['result'] ?? 'Unknown error',
+                            'finished_at' => $task['finished_at'] ?? null,
+                        ];
+                    }
+                }
+            }
+        }
+
+        return $stats;
+    }
+
+    /**
+     * Clear old task history.
+     *
+     * @param int $olderThanSeconds Remove tasks older than this many seconds
+     * @return int Number of tasks removed
+     */
+    public function clearTaskHistory(int $olderThanSeconds = 604800): int
+    {
+        $cutoff = microtime(true) - $olderThanSeconds;
+
+        // Get old task IDs
+        $oldTaskIds = $this->redis->zRangeByScore('task_history', '-inf', (string) $cutoff);
+
+        $removed = 0;
+        foreach ($oldTaskIds as $taskId) {
+            $this->redis->zRem('task_history', $taskId);
+            $this->redis->del("task_history:{$taskId}");
+            $removed++;
+        }
+
+        return $removed;
+    }
+
+    /**
+     * Get task count in history.
+     */
+    public function getTaskHistoryCount(): int
+    {
+        return $this->redis->zCard('task_history') ?: 0;
     }
 
     /**
