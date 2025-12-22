@@ -316,6 +316,54 @@ $removed = $modelq->clearTaskHistory(); // Default: 7 days
 $removed = $modelq->clearTaskHistory(3600); // Older than 1 hour
 ```
 
+### Worker Info
+
+Get detailed information about registered workers including system resources (CPU, RAM, GPU):
+
+```php
+// Get all registered workers
+$workers = $modelq->getWorkers();
+foreach ($workers as $workerId => $worker) {
+    echo "Worker: {$workerId}\n";
+    echo "  Status: {$worker['status']}\n";
+    echo "  Hostname: {$worker['hostname']}\n";
+    echo "  OS: {$worker['os']}\n";
+    
+    if ($worker['system_info']) {
+        $cpu = $worker['system_info']['cpu'];
+        $ram = $worker['system_info']['ram'];
+        
+        echo "  CPU: {$cpu['cores_logical']} cores ({$cpu['usage_percent']}% used)\n";
+        echo "  RAM: {$ram['total_gb']} GB ({$ram['used_percent']}% used)\n";
+        
+        // GPU info (if available)
+        foreach ($worker['system_info']['gpu'] as $gpu) {
+            echo "  GPU: {$gpu['name']} - {$gpu['memory_total_gb']} GB\n";
+            echo "       Utilization: {$gpu['gpu_utilization_percent']}%\n";
+        }
+    }
+    
+    echo "  Tasks: " . implode(', ', $worker['allowed_tasks']) . "\n";
+}
+
+// Get a specific worker by ID
+$worker = $modelq->getWorker('gpu-server-1');
+if ($worker) {
+    echo "Worker {$worker['worker_id']} is {$worker['status']}\n";
+}
+```
+
+Worker info includes:
+- `worker_id` - Unique worker identifier
+- `status` - Current status (idle, busy)
+- `allowed_tasks` - List of tasks this worker handles
+- `last_heartbeat` - Unix timestamp of last heartbeat
+- `hostname` - Worker hostname
+- `os` - Operating system info
+- `python_version` - Python version (for Python workers)
+- `php_version` - PHP version (for PHP workers)
+- `system_info` - Detailed CPU, RAM, and GPU information
+
 ### Delayed Tasks
 
 ```php

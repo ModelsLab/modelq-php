@@ -521,6 +521,77 @@ class ModelQ
     }
 
     /**
+     * Get all registered workers with their system info.
+     *
+     * Returns worker details including:
+     * - worker_id: Unique worker identifier
+     * - status: Current status (idle, busy)
+     * - allowed_tasks: List of tasks this worker handles
+     * - last_heartbeat: Unix timestamp of last heartbeat
+     * - system_info: CPU, RAM, GPU information (if provided by worker)
+     *
+     * @return array<string, array> Map of worker_id => worker data
+     */
+    public function getWorkers(): array
+    {
+        $workers = [];
+        $allServers = $this->redis->hGetAll('servers');
+
+        foreach ($allServers as $serverId => $dataJson) {
+            try {
+                $data = json_decode($dataJson, true);
+                $workers[$serverId] = [
+                    'worker_id' => $serverId,
+                    'status' => $data['status'] ?? 'unknown',
+                    'allowed_tasks' => $data['allowed_tasks'] ?? [],
+                    'last_heartbeat' => array_key_exists('last_heartbeat', $data) ? $data['last_heartbeat'] : null,
+                    'system_info' => array_key_exists('system_info', $data) ? $data['system_info'] : null,
+                    'hostname' => array_key_exists('hostname', $data) ? $data['hostname'] : null,
+                    'os' => array_key_exists('os', $data) ? $data['os'] : null,
+                    'python_version' => array_key_exists('python_version', $data) ? $data['python_version'] : null,
+                    'php_version' => array_key_exists('php_version', $data) ? $data['php_version'] : null,
+                ];
+            } catch (Throwable $e) {
+                $this->logger->warning("Could not parse worker data for {$serverId}: " . $e->getMessage());
+            }
+        }
+
+        return $workers;
+    }
+
+    /**
+     * Get a specific worker's info by ID.
+     *
+     * @param string $workerId The worker ID to look up
+     * @return array|null Worker data or null if not found
+     */
+    public function getWorker(string $workerId): ?array
+    {
+        $dataJson = $this->redis->hGet('servers', $workerId);
+        if (!$dataJson) {
+            return null;
+        }
+
+        try {
+            $data = json_decode($dataJson, true);
+            return [
+                'worker_id' => $workerId,
+                'status' => $data['status'] ?? 'unknown',
+                'allowed_tasks' => $data['allowed_tasks'] ?? [],
+                'last_heartbeat' => array_key_exists('last_heartbeat', $data) ? $data['last_heartbeat'] : null,
+                'system_info' => array_key_exists('system_info', $data) ? $data['system_info'] : null,
+                'hostname' => array_key_exists('hostname', $data) ? $data['hostname'] : null,
+                'os' => array_key_exists('os', $data) ? $data['os'] : null,
+                'python_version' => array_key_exists('python_version', $data) ? $data['python_version'] : null,
+                'php_version' => array_key_exists('php_version', $data) ? $data['php_version'] : null,
+            ];
+        } catch (Throwable $e) {
+            $this->logger->warning("Could not parse worker data for {$workerId}: " . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
      * Get all queued tasks.
      */
     public function getAllQueuedTasks(): array
