@@ -199,6 +199,27 @@ echo "Task ID: " . $task->taskId;
 $result = $task->getResult($modelq->getRedisClient(), timeout: 10);
 ```
 
+### Custom Task IDs
+
+By default, ModelQ generates a UUID for each task. You can provide your own task ID to correlate tasks with your database records:
+
+```php
+// Use your database record ID as the task ID
+$orderId = 'order-12345';
+$task = $modelq->enqueue('process_order', ['order_id' => $orderId], taskId: $orderId);
+
+echo $task->taskId; // 'order-12345'
+
+// Later, retrieve the task using the same ID
+$status = $modelq->getTaskStatus($orderId);
+$details = $modelq->getTaskDetails($orderId);
+```
+
+This is useful when you want to:
+- Track tasks using your existing database primary keys
+- Easily correlate queue tasks with database records
+- Look up task status without storing the generated UUID
+
 ### Streaming Tasks
 
 For tasks that produce incremental output (like ML text generation):

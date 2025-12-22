@@ -31,9 +31,10 @@ class Task
     public function __construct(
         string $taskName,
         array $payload,
-        int $timeout = 15
+        int $timeout = 15,
+        ?string $taskId = null
     ) {
-        $this->taskId = $this->generateUuid();
+        $this->taskId = $taskId ?? $this->generateUuid();
         $this->taskName = $taskName;
         $this->payload = $payload;
         $this->originalPayload = $payload;

@@ -147,9 +147,10 @@ class ModelQ
      *
      * @param string $taskName The name of the task to run
      * @param array $data The data to pass to the task
+     * @param string|null $taskId Optional custom task ID (uses UUID if not provided)
      * @return Task The queued task instance
      */
-    public function enqueue(string $taskName, array $data = []): Task
+    public function enqueue(string $taskName, array $data = [], ?string $taskId = null): Task
     {
         $options = $this->taskOptions[$taskName] ?? [];
 
@@ -162,7 +163,8 @@ class ModelQ
 
         $task = new Task(
             taskName: $taskName,
-            payload: $payload
+            payload: $payload,
+            taskId: $taskId
         );
 
         if ($options['stream'] ?? false) {
