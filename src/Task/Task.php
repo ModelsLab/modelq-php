@@ -27,12 +27,14 @@ class Task
     public int $timeout;
     public bool $stream = false;
     public string $combinedResult = '';
+    public array $additionalParams = [];
 
     public function __construct(
         string $taskName,
         array $payload,
         int $timeout = 15,
-        ?string $taskId = null
+        ?string $taskId = null,
+        ?array $additionalParams = null
     ) {
         $this->taskId = $taskId ?? $this->generateUuid();
         $this->taskName = $taskName;
@@ -40,6 +42,7 @@ class Task
         $this->originalPayload = $payload;
         $this->createdAt = microtime(true);
         $this->timeout = $timeout;
+        $this->additionalParams = $additionalParams ?? [];
     }
 
     /**
@@ -59,7 +62,7 @@ class Task
      */
     public function toArray(): array
     {
-        return [
+        $baseArray = [
             'task_id' => $this->taskId,
             'task_name' => $this->taskName,
             'payload' => $this->payload,
@@ -71,6 +74,13 @@ class Task
             'finished_at' => $this->finishedAt,
             'stream' => $this->stream,
         ];
+
+        // Add additional_params to the base response if they exist
+        if (!empty($this->additionalParams)) {
+            $baseArray = array_merge($baseArray, $this->additionalParams);
+        }
+
+        return $baseArray;
     }
 
     /**
@@ -78,9 +88,17 @@ class Task
      */
     public static function fromArray(array $data): self
     {
+        // Extract additional_params from data (any keys not in the standard set)
+        $standardKeys = [
+            'task_id', 'task_name', 'payload', 'status', 'result',
+            'created_at', 'queued_at', 'started_at', 'finished_at', 'stream'
+        ];
+        $additionalParams = array_diff_key($data, array_flip($standardKeys));
+
         $task = new self(
             taskName: $data['task_name'],
-            payload: $data['payload']
+            payload: $data['payload'],
+            additionalParams: !empty($additionalParams) ? $additionalParams : null
         );
 
         $task->taskId = $data['task_id'];

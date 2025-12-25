@@ -81,4 +81,71 @@ class ExceptionTest extends TestCase
 
         $this->assertSame($cause, $exception->getPrevious());
     }
+
+    public function testTaskTimeoutExceptionWithEmptyTaskId(): void
+    {
+        $exception = new TaskTimeoutException('');
+
+        $this->assertEquals('', $exception->taskId);
+        $this->assertStringContainsString('timed out', $exception->getMessage());
+    }
+
+    public function testTaskProcessingExceptionWithEmptyError(): void
+    {
+        $exception = new TaskProcessingException('task_name', '');
+
+        $this->assertEquals('task_name', $exception->taskName);
+        $this->assertNotEmpty($exception->getMessage());
+    }
+
+    public function testTaskProcessingExceptionWithSpecialCharacters(): void
+    {
+        $exception = new TaskProcessingException(
+            'special_task',
+            "Error with\nnewlines\tand\ttabs"
+        );
+
+        $this->assertStringContainsString('newlines', $exception->getMessage());
+        $this->assertStringContainsString('tabs', $exception->getMessage());
+    }
+
+    public function testTaskTimeoutExceptionWithUnicodeTaskId(): void
+    {
+        $exception = new TaskTimeoutException('task-🚀-123');
+
+        $this->assertEquals('task-🚀-123', $exception->taskId);
+    }
+
+    public function testRetryTaskExceptionCanBeRethrown(): void
+    {
+        $original = new RetryTaskException('First attempt');
+
+        try {
+            try {
+                throw $original;
+            } catch (RetryTaskException $e) {
+                throw new RetryTaskException('Second attempt', 0, $e);
+            }
+        } catch (RetryTaskException $e) {
+            $this->assertEquals('Second attempt', $e->getMessage());
+            $this->assertSame($original, $e->getPrevious());
+        }
+    }
+
+    public function testExceptionCodePreserved(): void
+    {
+        $exception = new TaskProcessingException('task', 'Error', 42);
+
+        $this->assertEquals(42, $exception->getCode());
+    }
+
+    public function testDeepExceptionChaining(): void
+    {
+        $root = new \Exception('Root');
+        $level1 = new \RuntimeException('Level 1', 0, $root);
+        $level2 = new TaskProcessingException('task', 'Level 2', 0, $level1);
+
+        $this->assertSame($level1, $level2->getPrevious());
+        $this->assertSame($root, $level2->getPrevious()->getPrevious());
+    }
 }

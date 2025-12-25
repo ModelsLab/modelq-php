@@ -136,4 +136,128 @@ class TaskTest extends TestCase
         $this->assertEquals(['original' => 'data'], $task->originalPayload);
         $this->assertEquals(['modified' => 'payload'], $task->payload);
     }
+
+    public function testTaskWithAdditionalParams(): void
+    {
+        $additionalParams = [
+            'user_id' => 'user_123',
+            'priority' => 'high',
+            'metadata' => ['source' => 'api', 'version' => '1.0'],
+        ];
+
+        $task = new Task(
+            'test_task',
+            ['key' => 'value'],
+            additionalParams: $additionalParams
+        );
+
+        $this->assertEquals($additionalParams, $task->additionalParams);
+    }
+
+    public function testTaskWithoutAdditionalParams(): void
+    {
+        $task = new Task('test_task', ['key' => 'value']);
+
+        $this->assertEquals([], $task->additionalParams);
+    }
+
+    public function testToArrayIncludesAdditionalParams(): void
+    {
+        $additionalParams = [
+            'user_id' => 'user_456',
+            'custom_field' => 'custom_value',
+        ];
+
+        $task = new Task(
+            'serialize_test',
+            ['data' => 123],
+            additionalParams: $additionalParams
+        );
+
+        $array = $task->toArray();
+
+        // Additional params should be merged at root level
+        $this->assertEquals('user_456', $array['user_id']);
+        $this->assertEquals('custom_value', $array['custom_field']);
+        // Standard fields should still exist
+        $this->assertEquals($task->taskId, $array['task_id']);
+        $this->assertEquals('serialize_test', $array['task_name']);
+    }
+
+    public function testToArrayWithEmptyAdditionalParams(): void
+    {
+        $task = new Task('test', ['data' => 123]);
+
+        $array = $task->toArray();
+
+        // Should only have standard keys
+        $expectedKeys = [
+            'task_id', 'task_name', 'payload', 'status', 'result',
+            'created_at', 'queued_at', 'started_at', 'finished_at', 'stream'
+        ];
+        sort($expectedKeys);
+        $actualKeys = array_keys($array);
+        sort($actualKeys);
+        $this->assertEquals($expectedKeys, $actualKeys);
+    }
+
+    public function testFromArrayExtractsAdditionalParams(): void
+    {
+        $data = [
+            'task_id' => 'test-uuid-12345',
+            'task_name' => 'restore_test',
+            'payload' => ['foo' => 'bar'],
+            'status' => 'completed',
+            'result' => 'success',
+            'created_at' => 1234567890.0,
+            'queued_at' => 1234567891.0,
+            'started_at' => 1234567892.0,
+            'finished_at' => 1234567893.0,
+            'stream' => false,
+            // Additional params
+            'user_id' => 'user_789',
+            'tracking_id' => 'track_001',
+        ];
+
+        $task = Task::fromArray($data);
+
+        $this->assertEquals([
+            'user_id' => 'user_789',
+            'tracking_id' => 'track_001',
+        ], $task->additionalParams);
+    }
+
+    public function testFromArrayWithNoAdditionalParams(): void
+    {
+        $data = [
+            'task_id' => 'test-uuid-12345',
+            'task_name' => 'restore_test',
+            'payload' => ['foo' => 'bar'],
+            'status' => 'completed',
+        ];
+
+        $task = Task::fromArray($data);
+
+        $this->assertEquals([], $task->additionalParams);
+    }
+
+    public function testAdditionalParamsRoundTrip(): void
+    {
+        $additionalParams = [
+            'user_id' => 'user_roundtrip',
+            'metadata' => ['nested' => 'value'],
+        ];
+
+        $original = new Task(
+            'roundtrip_test',
+            ['data' => 123],
+            additionalParams: $additionalParams
+        );
+
+        $array = $original->toArray();
+        $restored = Task::fromArray($array);
+
+        $this->assertEquals($original->additionalParams, $restored->additionalParams);
+        $this->assertEquals('user_roundtrip', $restored->additionalParams['user_id']);
+    }
 }

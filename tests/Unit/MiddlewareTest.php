@@ -22,6 +22,16 @@ class TestMiddleware extends Middleware
         $this->calls[] = 'afterWorkerBoot';
     }
 
+    public function beforeWorkerShutdown(): void
+    {
+        $this->calls[] = 'beforeWorkerShutdown';
+    }
+
+    public function afterWorkerShutdown(): void
+    {
+        $this->calls[] = 'afterWorkerShutdown';
+    }
+
     public function beforeEnqueue(?Task $task): void
     {
         $this->calls[] = ['beforeEnqueue', $task?->taskId];
@@ -118,5 +128,92 @@ class MiddlewareTest extends TestCase
 
         $this->assertEquals(['beforeEnqueue', null], $middleware->calls[0]);
         $this->assertEquals(['afterEnqueue', null], $middleware->calls[1]);
+    }
+
+    public function testBeforeWorkerShutdownCalled(): void
+    {
+        $middleware = new TestMiddleware();
+
+        $middleware->beforeWorkerShutdown();
+
+        $this->assertEquals('beforeWorkerShutdown', $middleware->calls[0]);
+    }
+
+    public function testAfterWorkerShutdownCalled(): void
+    {
+        $middleware = new TestMiddleware();
+
+        $middleware->afterWorkerShutdown();
+
+        $this->assertEquals('afterWorkerShutdown', $middleware->calls[0]);
+    }
+
+    public function testFullWorkerLifecycle(): void
+    {
+        $middleware = new TestMiddleware();
+        $task = new Task('lifecycle_task', ['key' => 'value']);
+
+        // Simulate full worker lifecycle
+        $middleware->beforeWorkerBoot();
+        $middleware->afterWorkerBoot();
+        $middleware->beforeEnqueue($task);
+        $middleware->afterEnqueue($task);
+        $middleware->beforeWorkerShutdown();
+        $middleware->afterWorkerShutdown();
+
+        $this->assertEquals('beforeWorkerBoot', $middleware->calls[0]);
+        $this->assertEquals('afterWorkerBoot', $middleware->calls[1]);
+        $this->assertEquals(['beforeEnqueue', $task->taskId], $middleware->calls[2]);
+        $this->assertEquals(['afterEnqueue', $task->taskId], $middleware->calls[3]);
+        $this->assertEquals('beforeWorkerShutdown', $middleware->calls[4]);
+        $this->assertEquals('afterWorkerShutdown', $middleware->calls[5]);
+    }
+
+    public function testBaseMiddlewareShutdownMethodsDoNothing(): void
+    {
+        $middleware = new ConcreteMiddleware();
+
+        // These should not throw
+        $middleware->beforeWorkerShutdown();
+        $middleware->afterWorkerShutdown();
+
+        $this->assertTrue(true);
+    }
+
+    public function testOnErrorWithNullException(): void
+    {
+        $middleware = new TestMiddleware();
+        $task = new Task('error_task', []);
+
+        $middleware->onError($task, null);
+
+        $this->assertEquals(['onError', $task->taskId, null], $middleware->calls[0]);
+    }
+
+    public function testOnErrorWithNullTaskAndException(): void
+    {
+        $middleware = new TestMiddleware();
+
+        $middleware->onError(null, null);
+
+        $this->assertEquals(['onError', null, null], $middleware->calls[0]);
+    }
+
+    public function testMiddlewareWithDifferentExceptionTypes(): void
+    {
+        $middleware = new TestMiddleware();
+        $task = new Task('exception_test', []);
+
+        // Test with RuntimeException
+        $middleware->onError($task, new \RuntimeException('Runtime error'));
+        $this->assertEquals(['onError', $task->taskId, 'Runtime error'], $middleware->calls[0]);
+
+        // Test with InvalidArgumentException
+        $middleware->onError($task, new \InvalidArgumentException('Invalid arg'));
+        $this->assertEquals(['onError', $task->taskId, 'Invalid arg'], $middleware->calls[1]);
+
+        // Test with Error (Throwable, not Exception)
+        $middleware->onError($task, new \TypeError('Type error'));
+        $this->assertEquals(['onError', $task->taskId, 'Type error'], $middleware->calls[2]);
     }
 }
