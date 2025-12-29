@@ -156,7 +156,9 @@ class ModelQ
         $options = $this->taskOptions[$taskName] ?? [];
 
         $payload = [
-            'data' => $data,
+            'data' => [
+                "args" => [$data],
+            ],
             'timeout' => $options['timeout'] ?? null,
             'stream' => $options['stream'] ?? false,
             'retries' => $options['retries'] ?? 0,
