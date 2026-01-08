@@ -660,12 +660,7 @@ class ModelQ
     public function getTaskDetails(string $taskId): ?array
     {
         // First try task_history (longer retention)
-        $taskData = $this->redis->get("task_history:{$taskId}");
-        if (!$taskData) {
-            // Fallback to task:{id}
-            $taskData = $this->redis->get("task:{$taskId}");
-        }
-
+       $taskData = $this->redis->get("task:{$taskId}");
         if ($taskData) {
             return json_decode($taskData, true);
         }
