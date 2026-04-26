@@ -270,14 +270,17 @@ class ModelQ
             $taskDict = json_decode($taskJson, true);
             $task = Task::fromArray($taskDict);
 
-            // Mark as processing
             $added = $this->redis->sAdd('processing_tasks', $task->taskId);
             if ($added === 0) {
                 $this->logger->warning("Task {$task->taskId} is already being processed. Skipping duplicate.");
                 continue;
             }
+
+            $now = microtime(true);
             $task->status = 'processing';
-            $taskDict['started_at'] = microtime(true);
+            $task->startedAt = $now;
+            $taskDict['status'] = 'processing';
+            $taskDict['started_at'] = $now;
             $this->redis->setex("task:{$task->taskId}", 86400, json_encode($taskDict));
 
             if (isset($this->allowedTasks[$task->taskName])) {
@@ -465,6 +468,8 @@ class ModelQ
 
         $this->redis->setex("task_result:{$task->taskId}", 3600, json_encode($taskDict));
         $this->redis->setex("task:{$task->taskId}", 86400, json_encode($taskDict));
+
+        $this->redis->zRem('queued_requests', $task->taskId);
 
         // Update task history
         $this->updateTaskHistory($task->taskId, $taskDict);
@@ -911,16 +916,19 @@ class ModelQ
             }
 
             $taskDict = json_decode($taskData, true);
-            $startedAt = $taskDict['started_at'] ?? 0;
-            if ($startedAt && ($now - $startedAt) > $threshold) {
+            // Fall back to queued_at when started_at is missing — covers workers
+            // that crashed in the SADD→SET window before started_at was persisted.
+            $reference = $taskDict['started_at'] ?? $taskDict['queued_at'] ?? null;
+            if ($reference && ($now - $reference) > $threshold) {
                 $this->logger->info(sprintf(
-                    "Re-queuing stuck task %s which has been 'processing' for %.2f seconds.",
+                    "Re-queuing stuck task %s (age %.2fs).",
                     $taskId,
-                    $now - $startedAt
+                    $now - $reference
                 ));
 
                 $taskDict['status'] = 'queued';
                 $taskDict['queued_at'] = $now;
+                $taskDict['started_at'] = null;
 
                 $this->redis->setex("task:{$taskId}", 86400, json_encode($taskDict));
                 $this->redis->rPush('ml_tasks', json_encode($taskDict));
