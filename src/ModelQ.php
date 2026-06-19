@@ -848,6 +848,12 @@ class ModelQ
      */
     public function removeTaskFromQueue(string $taskId): bool
     {
+        // Always drop the queue index and processing marker so a cancelled task
+        // is neither counted (queue_num / queue_time) nor picked up again — even
+        // if it has already left ml_tasks.
+        $this->redis->zRem('queued_requests', $taskId);
+        $this->redis->sRem('processing_tasks', $taskId);
+
         $tasks = $this->redis->lRange('ml_tasks', 0, -1);
         $removed = false;
 
@@ -856,7 +862,6 @@ class ModelQ
                 $taskDict = json_decode($taskJson, true);
                 if (($taskDict['task_id'] ?? '') === $taskId) {
                     $this->redis->lRem('ml_tasks', $taskJson, 1);
-                    $this->redis->zRem('queued_requests', $taskId);
                     $removed = true;
                     $this->logger->info("Removed task {$taskId} from queue.");
                     break;
