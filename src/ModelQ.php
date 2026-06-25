@@ -1194,6 +1194,77 @@ EOT;
     }
 
     /**
+     * Bulk variant of markTaskAsError for clearing dead load (e.g. a maintenance
+     * sweep that drains tasks already terminal in the app's system of record).
+     *
+     * Unlike calling markTaskAsError in a loop, this snapshots `ml_tasks` ONCE
+     * and removes matched elements with a targeted LREM, instead of re-reading
+     * the whole list per task — so draining thousands of leaked entries stays
+     * cheap. The cancellation flag is intentionally skipped: callers use this for
+     * tasks known to be finished, not to abort an in-flight worker.
+     *
+     * @param  array<int|string>  $taskIds
+     * @return int Number of task ids processed.
+     */
+    public function markTasksAsError(array $taskIds, ?string $reason = null): int
+    {
+        if (empty($taskIds)) {
+            return 0;
+        }
+
+        $reason = $reason ?? 'Task marked failed by external timeout';
+
+        // Snapshot ml_tasks once: task_id => raw json, so each removal is a single
+        // targeted LREM rather than a fresh full-list scan per task.
+        $mlByTaskId = [];
+        foreach ($this->redis->lRange('ml_tasks', 0, -1) as $json) {
+            $decoded = json_decode($json, true);
+            if (isset($decoded['task_id'])) {
+                $mlByTaskId[(string) $decoded['task_id']] = $json;
+            }
+        }
+
+        $now = microtime(true);
+        $processed = 0;
+
+        foreach ($taskIds as $taskId) {
+            $taskId = (string) $taskId;
+
+            $this->redis->zRem('queued_requests', $taskId);
+            $this->redis->sRem('processing_tasks', $taskId);
+
+            if (isset($mlByTaskId[$taskId])) {
+                $this->redis->lRem('ml_tasks', $mlByTaskId[$taskId], 1);
+            }
+
+            $taskJson = $this->redis->get("task:{$taskId}");
+            $taskDict = ($taskJson !== false && $taskJson !== null)
+                ? (json_decode($taskJson, true) ?: [])
+                : ['task_id' => $taskId];
+
+            $taskDict['task_id'] = $taskDict['task_id'] ?? $taskId;
+            $taskDict['status'] = 'failed';
+            $taskDict['finished_at'] = $now;
+            $taskDict['result'] = $reason;
+            $taskDict['error'] = [
+                'message' => $reason,
+                'type' => 'ExternalTimeout',
+            ];
+
+            $payload = json_encode($taskDict);
+            $this->redis->setex("task:{$taskId}", $this->taskTtl, $payload);
+            $this->redis->setex("task_result:{$taskId}", self::TASK_RESULT_RETENTION, $payload);
+            $this->updateTaskHistory($taskId, $taskDict);
+
+            $processed++;
+        }
+
+        $this->logger->info("Bulk marked {$processed} task(s) as error: {$reason}");
+
+        return $processed;
+    }
+
+    /**
      * Check if a task has been cancelled.
      * Workers should call this periodically during long-running tasks.
      */

@@ -407,6 +407,41 @@ class ModelQTest extends TestCase
         $this->assertTrue($modelq->markTaskAsError('evicted-task-1'));
     }
 
+    public function testMarkTasksAsErrorBulkDrainsManyWithOneMlTasksScan(): void
+    {
+        $modelq = new ModelQ(host: '127.0.0.1', port: 6379);
+        $modelq->task('bulk_error_test', fn($data) => $data);
+        $redis = $modelq->getRedisClient();
+
+        $a = $modelq->enqueue('bulk_error_test', ['n' => 1]);
+        $b = $modelq->enqueue('bulk_error_test', ['n' => 2]);
+        // A leaked queue index whose task:{id} key is already gone.
+        $redis->zAdd('queued_requests', (float) time(), 'bulk-evicted');
+
+        $count = $modelq->markTasksAsError([$a->taskId, $b->taskId, 'bulk-evicted'], 'dead load sweep');
+
+        $this->assertSame(3, $count);
+
+        foreach ([$a->taskId, $b->taskId, 'bulk-evicted'] as $id) {
+            $this->assertEquals(0.0, (float) ($redis->zScore('queued_requests', $id) ?: 0));
+            $details = $modelq->getTaskDetails($id);
+            $this->assertEquals('failed', $details['status']);
+            $this->assertEquals('dead load sweep', $details['error']['message']);
+        }
+
+        // Both real tasks left ml_tasks.
+        $queuedIds = array_column($modelq->getAllQueuedTasks(), 'task_id');
+        $this->assertNotContains($a->taskId, $queuedIds);
+        $this->assertNotContains($b->taskId, $queuedIds);
+    }
+
+    public function testMarkTasksAsErrorWithEmptyListIsANoOp(): void
+    {
+        $modelq = new ModelQ(host: '127.0.0.1', port: 6379);
+
+        $this->assertSame(0, $modelq->markTasksAsError([]));
+    }
+
     // -------------------------------------------------------------------------
     // Progress Tracking Tests
     // -------------------------------------------------------------------------
