@@ -360,6 +360,53 @@ class ModelQTest extends TestCase
         }
     }
 
+    public function testMarkTaskAsErrorDrainsQueueAndSetsFailedStatus(): void
+    {
+        $modelq = new ModelQ(host: '127.0.0.1', port: 6379);
+        $modelq->task('error_test', fn($data) => $data);
+        $redis = $modelq->getRedisClient();
+
+        $task = $modelq->enqueue('error_test', ['key' => 'value']);
+        // Simulate a worker having picked it up.
+        $redis->sAdd('processing_tasks', $task->taskId);
+
+        $existed = $modelq->markTaskAsError($task->taskId, 'give-up timeout');
+
+        $this->assertTrue($existed);
+
+        // Drained from every queue structure (the leak fix).
+        $queuedIds = array_column($modelq->getAllQueuedTasks(), 'task_id');
+        $this->assertNotContains($task->taskId, $queuedIds);
+        $this->assertEquals(0.0, (float) ($redis->zScore('queued_requests', $task->taskId) ?: 0));
+        $this->assertFalse($redis->sIsMember('processing_tasks', $task->taskId));
+
+        // Terminal failed state recorded with the reason.
+        $details = $modelq->getTaskDetails($task->taskId);
+        $this->assertEquals('failed', $details['status']);
+        $this->assertEquals('give-up timeout', $details['error']['message']);
+        $this->assertTrue($modelq->isTaskCancelled($task->taskId));
+    }
+
+    public function testMarkTaskAsErrorIsIdempotentAndSafeWhenKeyEvicted(): void
+    {
+        $modelq = new ModelQ(host: '127.0.0.1', port: 6379);
+        $redis = $modelq->getRedisClient();
+
+        // Key already evicted, but the leaked queue index still references it.
+        $redis->zAdd('queued_requests', (float) time(), 'evicted-task-1');
+
+        $existed = $modelq->markTaskAsError('evicted-task-1');
+        $this->assertFalse($existed); // no task:{id} key existed
+
+        // Index is still cleaned up, and a terminal record now exists.
+        $this->assertEquals(0.0, (float) ($redis->zScore('queued_requests', 'evicted-task-1') ?: 0));
+        $details = $modelq->getTaskDetails('evicted-task-1');
+        $this->assertEquals('failed', $details['status']);
+
+        // Calling again is a no-op that still reports the (now present) record.
+        $this->assertTrue($modelq->markTaskAsError('evicted-task-1'));
+    }
+
     // -------------------------------------------------------------------------
     // Progress Tracking Tests
     // -------------------------------------------------------------------------

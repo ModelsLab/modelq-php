@@ -1139,6 +1139,61 @@ EOT;
     }
 
     /**
+     * Mark a task as failed (terminal error) and fully drain it from the queue.
+     *
+     * Use this when an external system of record (e.g. the webhook-server
+     * timeout sweep, or the frontend /fetch give-up path) has already decided
+     * the request is dead and ModelQ must agree. Without this, a request the app
+     * has flipped to "error" in Mongo stays in `ml_tasks`/`queued_requests` and a
+     * worker still pops it and burns GPU on abandoned work — the queue leak.
+     *
+     * The task is removed from `ml_tasks`, `queued_requests` and
+     * `processing_tasks` so no worker (re)processes it, a cancellation flag is
+     * set so a worker mid-flight can bail, and the task record + result are
+     * written with status "failed" so any poller observes the failure. Idempotent
+     * and safe when the task key has already been evicted under memory pressure.
+     *
+     * @return bool True if a task record existed and was updated; false if only
+     *              the queue indexes were drained (key already gone).
+     */
+    public function markTaskAsError(string $taskId, ?string $reason = null): bool
+    {
+        $reason = $reason ?? 'Task marked failed by external timeout';
+
+        // Signal any worker currently processing this task to stop.
+        $this->redis->setex("task:{$taskId}:cancelled", $this->taskTtl, '1');
+
+        // Drop it from the work list + queue index + processing set so it is
+        // neither picked up nor re-counted. This is the leak fix.
+        $this->removeTaskFromQueue($taskId);
+
+        $taskJson = $this->redis->get("task:{$taskId}");
+        $existed = $taskJson !== false && $taskJson !== null;
+
+        // Synthesise a minimal record when the key was evicted, so the terminal
+        // state stays queryable and consistent with the queue drain.
+        $taskDict = $existed ? (json_decode($taskJson, true) ?: []) : ['task_id' => $taskId];
+
+        $taskDict['task_id'] = $taskDict['task_id'] ?? $taskId;
+        $taskDict['status'] = 'failed';
+        $taskDict['finished_at'] = microtime(true);
+        $taskDict['result'] = $reason;
+        $taskDict['error'] = [
+            'message' => $reason,
+            'type' => 'ExternalTimeout',
+        ];
+
+        $payload = json_encode($taskDict);
+        $this->redis->setex("task:{$taskId}", $this->taskTtl, $payload);
+        $this->redis->setex("task_result:{$taskId}", self::TASK_RESULT_RETENTION, $payload);
+        $this->updateTaskHistory($taskId, $taskDict);
+
+        $this->logger->info("Task {$taskId} marked as error: {$reason}");
+
+        return $existed;
+    }
+
+    /**
      * Check if a task has been cancelled.
      * Workers should call this periodically during long-running tasks.
      */
