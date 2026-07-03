@@ -623,6 +623,20 @@ class ModelQ
     }
 
     /**
+     * Get the number of tasks waiting in the queue.
+     *
+     * O(1) LLEN on `ml_tasks`. This is the fast path for queue-depth checks and
+     * autoscaling: unlike getAllQueuedTasks(), it does NOT LRANGE and deserialize
+     * every entry, so it stays cheap even when task payloads are large (which
+     * otherwise blocks Redis's single thread and can surface as client read
+     * timeouts under load).
+     */
+    public function getQueuedTaskCount(): int
+    {
+        return (int) $this->redis->lLen('ml_tasks');
+    }
+
+    /**
      * Get task status by ID.
      */
     public function getTaskStatus(string $taskId): ?string
@@ -1036,6 +1050,19 @@ class ModelQ
         }
 
         return $results;
+    }
+
+    /**
+     * Get the number of tasks currently being processed.
+     *
+     * O(1) SCARD on `processing_tasks`. Cheap alternative to
+     * count(getProcessingTasks()), which fetches and deserializes each record.
+     * May include a small number of stale ids until getProcessingTasks() prunes
+     * them; acceptable for depth/stat checks.
+     */
+    public function getProcessingTaskCount(): int
+    {
+        return (int) $this->redis->sCard('processing_tasks');
     }
 
     /**
