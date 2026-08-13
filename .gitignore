@@ -6,3 +6,4 @@ phpstan.neon
 .vscode/
 *.log
 modelq_errors.log
+.phpunit.cache/
