@@ -29,6 +29,7 @@ class ModelQ
     public const TASK_HISTORY_RETENTION = 86400;  // 24 hours (configurable)
     public const TASK_TTL = 86400;                 // 24 hours TTL for all tasks
     public const DEFAULT_STREAM_TIMEOUT = 300;     // 5 minutes default stream timeout
+    public const SCAN_BATCH = 500;                 // keys per SCAN round-trip
 
     private Redis $redis;
     private string $serverId;
@@ -247,7 +248,11 @@ class ModelQ
             if ($now - $lastPrune >= self::PRUNE_CHECK_INTERVAL) {
                 $this->pruneInactiveServers();
                 $this->requeueStuckProcessingTasks();
-                $this->pruneOldTaskResults();
+                // pruneOldTaskResults() is deliberately NOT called here. Every
+                // task_result key is written with a TTL, so Redis expires it on
+                // its own; running the scan every PRUNE_CHECK_INTERVAL only
+                // re-read the whole keyspace. Measured on a production shard
+                // over 26 days: 196.7M SCAN + 228.8M GET to issue 2 DELs.
                 $lastPrune = $now;
             }
 
@@ -957,36 +962,40 @@ class ModelQ
     }
 
     /**
-     * Prune old task results.
+     * Delete `task_result:*` keys (and their `task:*` twin) that lost their TTL
+     * and are older than $olderThanSeconds. Returns the number pruned.
+     *
+     * Expiry is Redis's job. Every task_result key is written with a TTL (see
+     * storeResult() and the webhook paths), so a key that still has one needs
+     * nothing from us. This only has to catch keys whose TTL went missing -- a
+     * write path that forgot the EX, a RENAME/RESTORE that dropped it -- which
+     * would otherwise live forever.
+     *
+     * The cost is in deciding *which* keys to read, not in the delete. TTL is an
+     * 8-byte reply and is pipelined, so a healthy keyspace is walked without
+     * transferring a single payload; only keys already known to be broken get
+     * read. The previous version GET the JSON of every key to compare one
+     * timestamp. Measured on a production shard over 26 days that was 196.7M
+     * SCAN + 228.8M GET -- roughly 2.2 hours of blocked event loop and 13.5TB of
+     * network output -- to issue 2 deletes.
+     *
+     * Bulk-reading with MGET would make this worse, not better: task_result
+     * payloads reach 7MB, so a batched read builds one huge client output
+     * buffer, and that is what pushes RSS past the container memory limit and
+     * gets redis-server OOM-killed.
      */
-    private function pruneOldTaskResults(?int $olderThanSeconds = null): void
+    public function pruneOldTaskResults(?int $olderThanSeconds = null): int
     {
         $olderThanSeconds = $olderThanSeconds ?? self::TASK_RESULT_RETENTION;
         $now = microtime(true);
-        $keysDeleted = 0;
+        $pruned = 0;
 
         $iterator = null;
-        while ($keys = $this->redis->scan($iterator, 'task_result:*', 100)) {
-            foreach ($keys as $key) {
-                try {
-                    $taskJson = $this->redis->get($key);
-                    if (!$taskJson) {
-                        continue;
-                    }
-
-                    $taskData = json_decode($taskJson, true);
-                    $timestamp = $taskData['finished_at'] ?? $taskData['started_at'] ?? null;
-
-                    if ($timestamp && ($now - $timestamp) > $olderThanSeconds) {
-                        $this->redis->del($key);
-                        $taskId = str_replace('task_result:', '', $key);
-                        $this->redis->del("task:{$taskId}");
-                        $keysDeleted++;
-                        $this->logger->info("Deleted old keys: {$key} and task:{$taskId}");
-                    }
-                } catch (Throwable $e) {
-                    $this->logger->error("Error processing key {$key}: " . $e->getMessage());
-                }
+        while ($keys = $this->redis->scan($iterator, 'task_result:*', self::SCAN_BATCH)) {
+            try {
+                $pruned += $this->pruneUntrackedKeys($keys, $now, $olderThanSeconds);
+            } catch (Throwable $e) {
+                $this->logger->error('Error pruning task_result batch: ' . $e->getMessage());
             }
 
             if ($iterator === 0) {
@@ -994,9 +1003,84 @@ class ModelQ
             }
         }
 
-        if ($keysDeleted > 0) {
-            $this->logger->info("Pruned {$keysDeleted} task(s) older than {$olderThanSeconds} seconds.");
+        if ($pruned > 0) {
+            $this->logger->info("Pruned {$pruned} task(s) older than {$olderThanSeconds} seconds.");
         }
+
+        return $pruned;
+    }
+
+    /**
+     * Prune the keys in one SCAN batch that have no TTL. Returns the number deleted.
+     *
+     * @param array<int, string> $keys
+     */
+    private function pruneUntrackedKeys(array $keys, float $now, int $olderThanSeconds): int
+    {
+        $pipe = $this->redis->multi(Redis::PIPELINE);
+        foreach ($keys as $key) {
+            $pipe->ttl($key);
+        }
+        $ttls = $pipe->exec();
+
+        // -1 == exists with no expiry (leaked). -2 == already gone.
+        // Anything with a TTL is Redis's problem, not ours.
+        $orphans = [];
+        foreach ($keys as $i => $key) {
+            if (($ttls[$i] ?? null) === -1) {
+                $orphans[] = $key;
+            }
+        }
+
+        if ($orphans === []) {
+            return 0;
+        }
+
+        // Only now do we read values, and only for the broken keys.
+        $pipe = $this->redis->multi(Redis::PIPELINE);
+        foreach ($orphans as $key) {
+            $pipe->get($key);
+        }
+        $blobs = $pipe->exec();
+
+        $expired = [];
+        $keep = [];
+        foreach ($orphans as $i => $key) {
+            $blob = $blobs[$i] ?? null;
+            $taskData = is_string($blob) ? json_decode($blob, true) : null;
+            $timestamp = is_array($taskData)
+                ? ($taskData['finished_at'] ?? $taskData['started_at'] ?? null)
+                : null;
+
+            if ($timestamp && ($now - $timestamp) > $olderThanSeconds) {
+                $expired[] = $key;
+            } else {
+                $keep[] = $key;
+            }
+        }
+
+        $pipe = $this->redis->multi(Redis::PIPELINE);
+        foreach ($expired as $key) {
+            $taskId = str_replace('task_result:', '', $key);
+            // UNLINK, not DEL: frees multi-MB payloads off the main thread.
+            $pipe->unlink($key);
+            $pipe->unlink("task:{$taskId}");
+        }
+        foreach ($keep as $key) {
+            // Not old enough to drop, but it must not live forever.
+            $pipe->expire($key, $olderThanSeconds);
+        }
+        $pipe->exec();
+
+        foreach ($expired as $key) {
+            $taskId = str_replace('task_result:', '', $key);
+            $this->logger->info("Pruned untracked {$key} and task:{$taskId}");
+        }
+        foreach ($keep as $key) {
+            $this->logger->warning("task_result key had no TTL, set to {$olderThanSeconds}s: {$key}");
+        }
+
+        return count($expired);
     }
 
     /**
