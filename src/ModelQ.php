@@ -30,6 +30,23 @@ class ModelQ
     public const TASK_TTL = 86400;                 // 24 hours TTL for all tasks
     public const DEFAULT_STREAM_TIMEOUT = 300;     // 5 minutes default stream timeout
 
+    /**
+     * Connection liveness.
+     *
+     * BLPOP_TIMEOUT is what we ask the *server* to wait. READ_TIMEOUT is what
+     * the *client* will wait for that answer to arrive. The second must exceed
+     * the first, or every idle poll aborts the read before Redis has replied.
+     *
+     * phpredis defaults both connect and read timeouts to 0, meaning "wait
+     * forever". A silently dropped TCP connection then parks the reader
+     * permanently: the server-side BLPOP timeout is irrelevant because the
+     * reply it would have produced can never reach us.
+     */
+    public const BLPOP_TIMEOUT = 1;      // seconds Redis holds the blocking pop
+    public const CONNECT_TIMEOUT = 5;    // seconds to establish a connection
+    public const READ_TIMEOUT = 10;      // seconds to wait for any single reply
+    public const TCP_KEEPALIVE = 60;     // seconds idle before the kernel probes
+
     private Redis $redis;
     private string $serverId;
     private array $allowedTasks = [];
@@ -62,7 +79,21 @@ class ModelQ
             $this->redis = $redisClient;
         } else {
             $this->redis = new Redis();
-            $this->redis->connect($host, $port);
+            // Bounded connect and read. Without the read timeout phpredis waits
+            // forever for a reply, so a half-open socket strands the caller
+            // instead of raising — see the constants above.
+            $this->redis->connect(
+                $host,
+                $port,
+                self::CONNECT_TIMEOUT,
+                null,
+                0,
+                self::READ_TIMEOUT
+            );
+            // Let the kernel notice a peer that has gone away while we are idle.
+            if (defined('Redis::OPT_TCP_KEEPALIVE')) {
+                $this->redis->setOption(Redis::OPT_TCP_KEEPALIVE, self::TCP_KEEPALIVE);
+            }
             if ($password) {
                 $this->redis->auth($password);
             }
@@ -259,7 +290,7 @@ class ModelQ
 
             // Process tasks
             $this->updateServerStatus('idle');
-            $taskData = $this->redis->blPop(['ml_tasks'], 1);
+            $taskData = $this->redis->blPop(['ml_tasks'], self::BLPOP_TIMEOUT);
 
             if (!$taskData) {
                 continue;
