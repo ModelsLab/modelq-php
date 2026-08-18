@@ -690,13 +690,52 @@ class ModelQ
     // ========================================
 
     /**
+     * Strip the request payload before a task is written to history.
+     *
+     * Enqueueing already stores the payload twice — once in the `ml_tasks` list
+     * for the worker to pop, and once under `task:{id}` because
+     * requeueStuckProcessingTasks() rebuilds a stuck job from that key. History
+     * was a third copy, held for TASK_HISTORY_RETENTION, and nothing reads it:
+     * getTaskHistory() and getTaskStats() only look at `status` and `task_name`,
+     * and getTaskDetails() reads `task:{id}`, never history.
+     *
+     * That third copy is what makes a large request expensive. A generation
+     * carrying an inline base64 image can push a multi-megabyte payload, so a
+     * single request could pin three times its own size in Redis for a day —
+     * enough for one caller to exhaust a database that many queues share.
+     *
+     * CAUTION for future changes: callers do read output links back out of the
+     * payload — the frontend resolves a finished generation via
+     * `payload.data.args.0.output` on whatever getTaskDetails() returns. That is
+     * safe only because getTaskDetails() reads `task:{id}`, which keeps its
+     * payload. If getTaskDetails() is ever given a `task_history:{id}` fallback
+     * (tests/Integration/ModelQTest.php::testTaskHistoryWithErrorDetails already
+     * expects one), a stripped history would resolve those links to an empty
+     * array and report finished work as producing no output. Restore the payload
+     * here, or keep the output slice, before adding that fallback.
+     *
+     * @param  array<string, mixed>  $taskData
+     * @return array<string, mixed>
+     */
+    private function withoutPayload(array $taskData): array
+    {
+        unset($taskData['payload']);
+
+        return $taskData;
+    }
+
+    /**
      * Add a task to history.
      */
     private function addToTaskHistory(string $taskId, array $taskData): void
     {
         $score = $taskData['created_at'] ?? microtime(true);
         $this->redis->zAdd('task_history', $score, $taskId);
-        $this->redis->setex("task_history:{$taskId}", self::TASK_HISTORY_RETENTION, json_encode($taskData));
+        $this->redis->setex(
+            "task_history:{$taskId}",
+            self::TASK_HISTORY_RETENTION,
+            json_encode($this->withoutPayload($taskData))
+        );
     }
 
     /**
@@ -704,7 +743,11 @@ class ModelQ
      */
     private function updateTaskHistory(string $taskId, array $taskData): void
     {
-        $this->redis->setex("task_history:{$taskId}", self::TASK_HISTORY_RETENTION, json_encode($taskData));
+        $this->redis->setex(
+            "task_history:{$taskId}",
+            self::TASK_HISTORY_RETENTION,
+            json_encode($this->withoutPayload($taskData))
+        );
     }
 
     /**
