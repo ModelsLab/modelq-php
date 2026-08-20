@@ -213,16 +213,23 @@ class ModelQ
         $taskDict['queued_at'] = $now;
 
         $this->enqueueTask($taskDict, $payload);
-        $this->redis->setex("task:{$task->taskId}", 86400, json_encode($taskDict));
-
-        // Add to task history
-        $this->addToTaskHistory($task->taskId, $taskDict);
 
         return $task;
     }
 
     /**
      * Push a task into the queue.
+     *
+     * All five writes go out as one pipeline. They used to be five separate
+     * commands, each waiting for its own reply before the next was sent, which
+     * costs five network round trips on the caller's request path -- 1.36s
+     * measured from a producer in us-east4 against the Redis in Mumbai, on
+     * every generation request. Redis still executes them in order; only the
+     * waiting is removed.
+     *
+     * Order is also corrected while we are here: the task's own state is
+     * written before the id is advertised on `ml_tasks`, so a worker can no
+     * longer pop a task whose `task:{id}` key does not exist yet.
      */
     private function enqueueTask(array $taskData, array $payload): void
     {
@@ -233,8 +240,22 @@ class ModelQ
             $taskData['queued_at'] = microtime(true);
         }
 
-        $this->redis->rPush('ml_tasks', json_encode($taskData));
-        $this->redis->zAdd('queued_requests', $taskData['queued_at'], $taskData['task_id']);
+        $taskId = $taskData['task_id'];
+        $encoded = json_encode($taskData);
+        $historyScore = $taskData['created_at'] ?? $taskData['queued_at'];
+
+        $this->redis->multi(Redis::PIPELINE)
+            ->setex("task:{$taskId}", self::TASK_TTL, $encoded)
+            ->zAdd('task_history', $historyScore, $taskId)
+            ->setex(
+                "task_history:{$taskId}",
+                self::TASK_HISTORY_RETENTION,
+                json_encode($this->withoutPayload($taskData))
+            )
+            ->rPush('ml_tasks', $encoded)
+            ->zAdd('queued_requests', $taskData['queued_at'], $taskId)
+            ->exec();
+
         $this->checkMiddleware('after_enqueue');
     }
 
@@ -722,20 +743,6 @@ class ModelQ
         unset($taskData['payload']);
 
         return $taskData;
-    }
-
-    /**
-     * Add a task to history.
-     */
-    private function addToTaskHistory(string $taskId, array $taskData): void
-    {
-        $score = $taskData['created_at'] ?? microtime(true);
-        $this->redis->zAdd('task_history', $score, $taskId);
-        $this->redis->setex(
-            "task_history:{$taskId}",
-            self::TASK_HISTORY_RETENTION,
-            json_encode($this->withoutPayload($taskData))
-        );
     }
 
     /**

@@ -14,6 +14,25 @@ use Redis;
  */
 class Task
 {
+    /**
+     * Result-polling cadence, in microseconds.
+     *
+     * The loop used to wake every 100ms for the whole wait. Two GETs per wake
+     * against a Redis 271ms away is ~100 pointless round trips on a 30s wait,
+     * and the caller's worker is pinned for all of it -- on flux_klein only
+     * 5.7% of tasks finish inside that window, so 94% of those requests paid
+     * the full cost to learn nothing.
+     *
+     * Backing off rather than moving straight to a flat 1s keeps the fast
+     * endpoints fast: realtime_turbo runs in 1.18s at p50 and 100% of its tasks
+     * finish inside 10s, so a flat 1s poll would add up to a second to a
+     * one-second job. Starting at 100ms and doubling to a 1s ceiling gives
+     * sub-second tasks the tight loop they need and long ones a quiet one.
+     */
+    public const POLL_MIN_INTERVAL_US = 100000;   // 100ms
+
+    public const POLL_MAX_INTERVAL_US = 1000000;  // 1s
+
     public string $taskId;
     public string $taskName;
     public array $payload;
@@ -192,15 +211,15 @@ class Task
     ): mixed {
         $timeout = $timeout ?? $this->timeout;
         $startTime = microtime(true);
+        $interval = self::POLL_MIN_INTERVAL_US;
 
         while ((microtime(true) - $startTime) < $timeout) {
-            // Check if task was cancelled
-            if ($this->isCancelled($redis)) {
+            [$cancelled, $taskJson] = $this->readResultState($redis);
+
+            if ($cancelled) {
                 $this->status = 'cancelled';
                 throw new TaskProcessingException($this->taskName, 'Task was cancelled');
             }
-
-            $taskJson = $redis->get("task_result:{$this->taskId}");
 
             if ($taskJson) {
                 $taskData = json_decode($taskJson, true);
@@ -224,10 +243,40 @@ class Task
                 }
             }
 
-            usleep(100000); // Sleep 100ms
+            usleep($interval);
+            $interval = min($interval * 2, self::POLL_MAX_INTERVAL_US);
         }
 
         throw new TaskTimeoutException($this->taskId);
+    }
+
+    /**
+     * Read the cancel flag and the result in a single round trip.
+     *
+     * These were two sequential GETs. Against a Redis one ocean away that is
+     * two waits per poll for information that is always read together.
+     *
+     * @return array{0: bool, 1: string|false|null}
+     */
+    private function readResultState(Redis $redis): array
+    {
+        $replies = $redis->multi(Redis::PIPELINE)
+            ->get("task:{$this->taskId}:cancelled")
+            ->get("task_result:{$this->taskId}")
+            ->exec();
+
+        if (!is_array($replies)) {
+            // A pipeline that did not come back cleanly says nothing about the
+            // task. Report "not cancelled, no result yet" and let the loop
+            // decide on the next pass, exactly as a pair of empty GETs would.
+            return [false, null];
+        }
+
+        // Match isCancelled() exactly: any stored value means cancelled, so a
+        // literal "0" must not be read as "still running".
+        $cancelFlag = $replies[0] ?? false;
+
+        return [$cancelFlag !== false && $cancelFlag !== null, $replies[1] ?? null];
     }
 
     /**
